@@ -5,7 +5,9 @@
 
 * Overview
 
-This is a static site source built with GNU M4, Org-mode, and Make. It provides. This site generating approach was strongly inspired by LdBeth's blog at https://ldbeth.sdf.org/mcs.html
+This is a static site source built with GNU M4, Org-mode, and
+Make. . This site generating approach was strongly inspired by
+LdBeth's blog at https://ldbeth.sdf.org/mcs.html
 
 
 * Project Structure
