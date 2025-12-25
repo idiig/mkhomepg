@@ -98,7 +98,7 @@
   "Get current date in YYYY-MM-DD format."
   (strftime "%Y-%m-%d" (localtime (current-time))))
 
-;;; News file operations
+;;; String utilities
 
 (define (non-empty-line? line)
   "Check if line is non-empty (not just whitespace)."
@@ -108,64 +108,3 @@
 (define (filter-non-empty-lines lines)
   "Filter out empty lines from a list."
   (filter non-empty-line? lines))
-
-(define (parse-news-file file)
-  "Parse news-index.m4 into sections.
-  
-  Returns: (header latest old older footer)"
-  (call-with-input-file file
-    (lambda (port)
-      (let loop ((section 'header)
-                 (header '())
-                 (latest '())
-                 (old '())
-                 (older '())
-                 (footer '()))
-        (let ((line (read-line port)))
-          (cond
-           ((eof-object? line)
-            (list (reverse header)
-                  (reverse latest)
-                  (reverse old)
-                  (reverse older)
-                  (reverse footer)))
-           ((string-match "^BEGNEWS" line)
-            (loop 'latest (cons line header) latest old older footer))
-           ((string-match "^OLD" line)
-            (loop 'old header latest (cons line old) older footer))
-           ((string-match "^ODD" line)
-            (loop 'older header latest old (cons line older) footer))
-           ((string-match "^ENDNEWS" line)
-            (loop 'footer header latest old older (cons line footer)))
-           ((eq? section 'header)
-            (loop section (cons line header) latest old older footer))
-           ((eq? section 'latest)
-            (loop section header (cons line latest) old older footer))
-           ((eq? section 'old)
-            (loop section header latest (cons line old) older footer))
-           ((eq? section 'older)
-            (loop section header latest old (cons line older) footer))
-           ((eq? section 'footer)
-            (loop section header latest old older (cons line footer)))))))))
-
-(define (rebuild-news-file sections)
-  "Rebuild news file from sections.
-  
-  sections: (header latest old older footer)"
-  (let ((header (car sections))
-        (latest (cadr sections))
-        (old (caddr sections))
-        (older (cadddr sections))
-        (footer (car (cddddr sections))))
-    (string-join
-     (append header
-             (list "")
-             latest
-             (list "")
-             old
-             (list "")
-             older
-             (list "")
-             footer)
-     "\n"
-     'suffix)))
