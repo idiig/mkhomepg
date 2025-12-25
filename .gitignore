@@ -1,0 +1,4 @@
+/.emacs-lsp-paths
+/.direnv/
+/.cache/
+/src/references.bib

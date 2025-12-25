@@ -1,0 +1,12 @@
+p {
+    width: 80ch;
+    max-width: 100%;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    word-break: normal;
+    line-break: strict;
+    white-space: pre-line;
+}
+i + p {
+    margin-top: 0;
+}

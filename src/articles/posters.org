@@ -1,0 +1,13 @@
+#+title: A collection of our posters
+#+date: 2025:12:26
+#+tags: poster, conference, works
+#+bibliography: ../../references.bib
+
+#+caption: Jinmoncom 2025 @ Kyushu University [cite/cf:@chin2025Goi]
+#+attr_latex: scale=0.75
+#+label: fig:jinmoncom2025
+#+attr_html: :width 30%
+[[file:posters/jinmoncom2025.pdf]]
+
+#+print_bibliography:
+

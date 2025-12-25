@@ -1,0 +1,1663 @@
+#+TITLE: Static Site with M4, Org-mode, and Make
+#+AUTHOR: idiig
+#+DATE: 2025:12:15
+#+OPTIONS: num:nil toc:t
+
+* Overview
+
+This is a static site source built with GNU M4, Org-mode, and Make. It provides. This site generating approach was strongly inspired by LdBeth's blog at https://ldbeth.sdf.org/mcs.html
+
+
+* Project Structure
+
+#+begin_src
+mkhomepg/
+├── .dir-locals.el                    # Emacs directory-local settings
+├── Makefile                          # Build automation
+├── README.org                        # This file
+│
+├── scripts/                          # Build scripts
+│   ├── site-utils.scm                # Shared utility library for Guile scripts
+│   ├── extract-articles-metadata.el  # Elisp script to extract article metadata
+│   ├── export-article-body.el        # Elisp script to export org to HTML body
+│   ├── wrap-article.scm              # Guile script to wrap HTML with M4
+│   ├── detect-file-changes.scm       # Guile library for file change detection
+│   ├── update-article-index.scm      # Guile script to update article index
+│   └── update-news.scm               # Guile script to update news with overflow cleanup
+│
+├── .cache/                           # Build cache (git-ignored)
+│   └── file-hashes.scm               # SHA256 hashes for change detection
+│
+├── src/                              # Source files (not published)
+│   ├── m4/                           # M4 macro definitions
+│   │   ├── layout.m4                 # Site-wide variables and layout macros
+│   │   ├── news.m4                   # News system (BEGNEWS, ITEM, etc.)
+│   │   └── article.m4                # Article page template
+│   ├── templates/                    # HTML template fragments
+│   │   ├── header.html.m4            # Site header (navigation, <head>)
+│   │   └── footer.html.m4            # Site footer (copyright, etc.)
+│   ├── content/                      # Content data
+│   │   └── news-index.m4             # News items (BEGNEWS...ENDNEWS)
+│   ├── articles/                     # Org-mode articles (source)
+│   │   ├── *.org
+│   │   ├── example/                  # Article-specific image folder
+│   │   │   ├── xx.png
+│   │   │   └── xx.svg
+│   │   └── another-post/
+│   │       └── photo.jpg
+│   ├── index.m4                      # Homepage template
+│   ├── old.m4                        # Old news page template
+│   └── articles-index.m4             # Articles index page template
+│
+└── public/                           # Published output (upload to server)
+    ├── index.html                    # Generated homepage
+    ├── old.html                      # Generated old news page
+    ├── articles/                     # Generated articles
+    │   ├── index.html                # Articles index page
+    │   ├── *.html
+    │   ├── example/                  # Copied image folders
+    │   │   ├── screenshot.png
+    │   │   └── diagram.svg
+    │   └── another-post/
+    │       └── photo.jpg
+    └── css/                          # Stylesheets
+        └── style.css
+#+end_src
+
+* System Components
+
+** News System
+
+The news system uses M4's diversion mechanism to categorize news items into three sections:
+
+- *Latest News*: Displayed on the homepage
+- *Older News*: Shown on the old news page
+- *Even Older News*: Also shown on the old news page
+
+*** Data Flow
+
+#+begin_example
+src/content/news-index.m4 
+  → src/m4/news.m4 (processes BEGNEWS/ITEM/OLD/ENDNEWS)
+  → src/index.m4 (invokes NEWS macro)
+  → src/m4/layout.m4 (provides HEADER/FOOTER)
+  → src/templates/*.html.m4 (HTML structure)
+  → public/index.html (final output)
+#+end_example
+
+*** Key Mechanisms
+
+- *Diversion buffers*: M4 uses 3 buffers (1=latest, 2=old, 3=older)
+- *ITEM macro*: Determines which buffer to use based on current section (=_sec=)
+- *ENDNEWS*: Defines =NEWS=/=ONEWS=/=ENEWS= as =undivert(1/2/3)=
+- *CLEANUP_NEWS*: Clears unused buffers to prevent content leakage
+
+*** Adding News Items
+
+Edit =src/news-index.m4=:
+
+#+begin_src m4 
+  BEGNEWS
+
+  ITEM([<b>2025-01-15</b>: New article published])
+  ITEM([<b>2025-01-05</b>: Website redesign completed])
+
+  OLD
+
+  ITEM([<b>2024-11-10</b>: Initial website launch])
+  
+  ODD
+
+  ITEM([<b>2024-11-01</b>: Project inception])
+
+  ENDNEWS
+#+end_src
+
+*** Building News Pages
+
+#+begin_src bash
+# Update homepage
+make public/index.html
+
+# Update old news page
+make public/old.html
+
+# Update all news pages
+make pages
+#+end_src
+
+** Utility Library
+
+The =scripts/site-utils.scm= module provides shared utilities for all Guile scripts, including M4 calling, metadata extraction, user interaction, and news file operations.
+
+*** Features
+
+- *Plist operations*: Extract properties from elisp-style property lists
+- *Metadata extraction*: Call elisp scripts to extract article metadata
+- *Safe M4 calling*: Use =open-pipe*= to avoid shell injection vulnerabilities
+- *User interaction*: Yes/no prompts and string input with defaults
+- *News file parsing*: Parse and rebuild news-index.m4 structure
+- *Date utilities*: Generate current date in YYYY-MM-DD format
+
+*** Implementation
+
+#+begin_src scheme :tangle scripts/site-utils.scm
+#!/usr/bin/env guile
+!#
+
+(define-module (site-utils)
+  #:use-module (ice-9 popen)
+  #:use-module (ice-9 rdelim)
+  #:use-module (ice-9 regex)
+  #:use-module (srfi srfi-1)
+  #:export (get-property
+            extract-article-metadata
+            extract-all-articles-metadata
+            call-m4
+            ask-yes-no
+            ask-string
+            current-date-string
+            non-empty-line?
+            filter-non-empty-lines))
+
+;;; Plist operations
+
+(define (get-property plist key)
+  "Get property from plist."
+  (let loop ((lst plist))
+    (cond
+     ((null? lst) #f)
+     ((eq? (car lst) key) (cadr lst))
+     (else (loop (cddr lst))))))
+
+;;; Metadata extraction
+
+(define (extract-all-articles-metadata)
+  "Extract metadata for all articles using elisp script."
+  (let* ((pipe (open-input-pipe "emacs --batch --script scripts/extract-articles-metadata.el"))
+         (data (read pipe)))
+    (close-pipe pipe)
+    data))
+
+(define (extract-article-metadata org-file)
+  "Extract metadata for a single article."
+  (let* ((all-data (extract-all-articles-metadata))
+         (base-name (basename org-file ".org")))
+    (find (lambda (article)
+            (string=? (get-property article ':file) base-name))
+          all-data)))
+
+;;; M4 calling
+
+(define* (call-m4 defines files #:optional output-file)
+  "Call M4 with safe parameter passing.
+
+  defines: Association list of (name . value) pairs for M4 defines
+  files: List of M4 input files to process
+  output-file: Optional output file path (if omitted, returns output as string)
+
+  Example:
+    (call-m4 '((\"PAGE_TITLE\" . \"My Page\")
+               (\"CONTENT\" . \"<p>Hello</p>\"))
+             '(\"layout.m4\" \"page.m4\")
+             \"output.html\")"
+  (let* ((m4-args (append
+                  (apply append
+                         (map (lambda (def)
+                                (list "-D" (string-append (car def) "=" (cdr def))))
+                              defines))
+                  files))
+         (pipe (apply open-pipe* OPEN_READ "m4" m4-args))
+         (output (read-string pipe)))
+    (close-pipe pipe)
+    (if output-file
+        (begin
+          (call-with-output-file output-file
+            (lambda (port)
+              (display output port)))
+          output-file)
+        output)))
+
+;;; User interaction
+
+(define (ask-yes-no prompt)
+  "Ask user a yes/no question."
+  (display prompt)
+  (force-output)
+  (let ((answer (read-line)))
+    (member answer '("y" "Y" "yes" "Yes" "YES"))))
+
+(define (ask-string prompt default)
+  "Ask user for input with default value."
+  (display (format #f "~a [~a]: " prompt default))
+  (force-output)
+  (let ((answer (read-line)))
+    (if (string=? answer "")
+        default
+        answer)))
+
+;;; Date utilities
+
+(define (current-date-string)
+  "Get current date in YYYY-MM-DD format."
+  (strftime "%Y-%m-%d" (localtime (current-time))))
+
+;;; News file operations
+
+(define (non-empty-line? line)
+  "Check if line is non-empty (not just whitespace)."
+  (and (string? line)
+       (not (string-match "^[[:space:]]*$" line))))
+
+(define (filter-non-empty-lines lines)
+  "Filter out empty lines from a list."
+  (filter non-empty-line? lines))
+
+(define (parse-news-file file)
+  "Parse news-index.m4 into sections.
+  
+  Returns: (header latest old older footer)"
+  (call-with-input-file file
+    (lambda (port)
+      (let loop ((section 'header)
+                 (header '())
+                 (latest '())
+                 (old '())
+                 (older '())
+                 (footer '()))
+        (let ((line (read-line port)))
+          (cond
+           ((eof-object? line)
+            (list (reverse header)
+                  (reverse latest)
+                  (reverse old)
+                  (reverse older)
+                  (reverse footer)))
+           ((string-match "^BEGNEWS" line)
+            (loop 'latest (cons line header) latest old older footer))
+           ((string-match "^OLD" line)
+            (loop 'old header latest (cons line old) older footer))
+           ((string-match "^ODD" line)
+            (loop 'older header latest old (cons line older) footer))
+           ((string-match "^ENDNEWS" line)
+            (loop 'footer header latest old older (cons line footer)))
+           ((eq? section 'header)
+            (loop section (cons line header) latest old older footer))
+           ((eq? section 'latest)
+            (loop section header (cons line latest) old older footer))
+           ((eq? section 'old)
+            (loop section header latest (cons line old) older footer))
+           ((eq? section 'older)
+            (loop section header latest old (cons line older) footer))
+           ((eq? section 'footer)
+            (loop section header latest old older (cons line footer)))))))))
+
+(define (rebuild-news-file sections)
+  "Rebuild news file from sections.
+  
+  sections: (header latest old older footer)"
+  (let ((header (car sections))
+        (latest (cadr sections))
+        (old (caddr sections))
+        (older (cadddr sections))
+        (footer (car (cddddr sections))))
+    (string-join
+     (append header
+             (list "")
+             latest
+             (list "")
+             old
+             (list "")
+             older
+             (list "")
+             footer)
+     "\n"
+     'suffix)))
+#+end_src
+
+** Article System
+
+Articles are written in Org-mode and converted to HTML with site-wide header and footer.
+
+*** Data Flow
+
+#+begin_example
+src/articles/test.org
+  → scripts/export-article-body.el (elisp)
+    → Exports body-only HTML to src/articles/test.html (temporary)
+  → scripts/wrap-article.scm (guile)
+    → Extracts title from org file
+    → Reads HTML body from temporary file
+    → Calls M4 with PAGE_TITLE and ARTICLE_BODY
+    → Outputs to public/articles/test.html
+    → Deletes temporary file
+  → Automatically triggers article index rebuild
+#+end_example
+
+*** Key Mechanisms
+
+- *Body-only export*: Elisp script uses =org-html-export-to-html nil nil nil t=
+- *Title extraction*: Guile script uses regex to extract =#+TITLE:=
+- *M4 wrapping*: Guile calls M4 with =PAGE_TITLE= and =ARTICLE_BODY= variables
+- *H1 heading*: =src/m4/article.m4= automatically adds =<h1>PAGE_TITLE</h1>=
+- *Auto-index update*: Makefile triggers index rebuild after each article
+
+*** Writing Articles
+
+Create a new org file in =src/articles/=:
+
+#+begin_src org :tangle src/articles/example.org
+  ,#+title: My Article Title
+  ,#+date: 2025-01-15
+  ,#+tags: emacs, nix, tutorial
+
+  ,* Introduction
+
+  Content here...
+
+  ,* Screenshots
+
+  Here's a screenshot of my setup:
+
+  ,#+caption: Test
+  ,#+attr_html: :width 30%
+  [[./example/screenshot.png]]
+
+  And a Test diagram:
+
+  ,#+attr_html: :width 30%
+  [[./example/diagram.svg]]
+
+  ,* Main Section
+
+  More content...
+
+  For more details, see my [[file:articles/test.org][another article]].
+
+  Also check out [[https://www.gnu.org/software/emacs/][GNU Emacs official site]].
+
+  ,* Conclusion
+
+  Final thoughts...
+#+end_src
+
+*Note:* Images are referenced using relative paths (=./example/screenshot.png=). Create the image folder with the same name as your org file:
+
+#+begin_src bash
+mkdir -p src/articles/example
+cp ~/my-screenshot.png src/articles/example/screenshot.png
+#+end_src
+
+*** Building Articles
+
+#+begin_src bash
+# Build single article
+make public/articles/test.html
+
+# Build all articles
+make articles
+#+end_src
+
+** M4 Macro System
+
+*** Variable Definition Hierarchy
+
+1. *Global variables* (=src/m4/layout.m4=): =SITE_NAME=, =AUTHOR=, =YEAR=, etc.
+2. *Page variables* (each =.m4= file): =PAGE_TITLE=
+3. *Dynamic variables* (command-line): =ARTICLE_BODY=
+
+*** Macro Expansion Chain
+
+#+begin_example
+HEADER (expands to)
+  → include(src/templates/header.html.m4)
+    → Replaces SITE_NAME, PAGE_TITLE, etc.
+    → Outputs HTML
+#+end_example
+
+*** Quote Mechanisms
+
+- =src/m4/layout.m4=: Uses backticks =`=
+- =src/m4/news.m4=: Uses square brackets =[ ]= (via =changequote=)
+- =src/news-index.m4=: Uses square brackets =[ ]=
+
+* Configuration Files
+
+** Global Site Variables
+
+#+begin_src m4 :tangle src/m4/layout.m4
+  define(`APOSTROPHE', `'')dnl
+
+  dnl Site-wide global variables
+  define(`SITE_NAME', `idg'APOSTROPHE`s Homepage')dnl
+  define(`AUTHOR', `idg')dnl
+  define(`YEAR', `2025')dnl
+  define(`GITHUB_USER', `idiig')dnl
+  define(`MASTODON_USER', `idiig')dnl
+
+  dnl Include header and footer templates
+  define(`HEADER', `include(src/templates/header.html.m4)')dnl
+  define(`FOOTER', `include(src/templates/footer.html.m4)')dnl
+#+end_src
+
+** News System Macros
+
+#+begin_src m4 :tangle src/m4/news.m4
+changequote([,])dnl
+dnl News system
+
+dnl Internal state variables
+define([_sec], [1])dnl
+define([_oldcount], [0])dnl
+
+dnl Section markers
+define([BEGNEWS], [divert(1)])dnl
+define([OLD],     [define([_sec], [2])divert(2)])dnl
+define([ODD],     [define([_sec], [3])divert(3)])dnl
+
+dnl Add a news item
+define([ITEM], [dnl
+ifelse(_sec, 1, , [define([_oldcount], incr(_oldcount))])dnl
+<p>$1</p>
+])dnl
+
+dnl Finalize and define output macros
+define([ENDNEWS], [dnl
+divert(0)dnl
+define([NEWS], [undivert(1)])dnl
+define([ONEWS], [undivert(2)])dnl
+define([ENEWS], [undivert(3)])dnl
+define([ONUM], _oldcount)dnl
+])dnl
+
+dnl Helper macro to clean up all news buffers
+define([CLEANUP_NEWS], [dnl
+divert(-1)dnl
+undivert(1)dnl
+undivert(2)dnl
+undivert(3)dnl
+divert(0)dnl
+])dnl
+#+end_src
+
+** Article Template
+
+#+begin_src m4 :tangle src/m4/article.m4
+HEADER
+
+<main id="main" class="article">
+<h1>PAGE_TITLE</h1>
+ARTICLE_BODY
+</main>
+
+FOOTER
+#+end_src
+
+** Site Header Template
+
+#+begin_src html :tangle src/templates/header.html.m4
+  <!DOCTYPE html>
+  <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <link rel="icon" type="image/jpg" href="/assets/salt.jpg">
+      <link rel="stylesheet" href="/css/style.css">
+      <title>PAGE_TITLE - SITE_NAME</title>
+    </head>
+    <body>
+      <header><h3>SITE_NAME</h3>
+        <nav>
+  	<a href="#main" class="skip">Skip Navigation</a> |
+  	<a href="/">Home</a> |
+  	<a href="/articles/index.html">Articles</a> |
+  	<a href="https://emacs-china.org">Emacs China</a> |
+  	<a href="https://github.com/GITHUB_USER">GitHub</a> |
+  	<a rel="me" href="https://fedihum.org/@MASTODON_USER">Mastodon</a> |
+  	<a rel="me" href="https://researchmap.jp/">Researchmap</a> |
+  	<a rel="me" href="https://orcid.org/">ORCID</a>
+      </nav></header>
+      <hr>
+#+end_src
+
+** Site Footer Template
+
+#+begin_src html :tangle src/templates/footer.html.m4
+      <hr>
+      <footer>
+        <i>Hosting for this site is provided by</i>
+        <p><a target="new" href="http://sdf.org">
+  	<img alt="SDF Banner"
+            src="https://sdf.org/sdfbanner.png"></a>
+        </p>
+        <p><b>The SDF Public Access UNIX System</b></p>
+        <p><a target="new" href="https://www.gnu.org/software/m4/">GNU M4</a>, <a target="new" href="https://www.gnu.org/software/emacs/">GNU Emacs</a> and <a target="new" href="https://orgmode.org/">Org Mode</a>
+  	are used to build this site.</p>
+        <p>&copy;YEAR AUTHOR</p>
+        <p><a rel="license" href="http://creativecommons.org/licenses/by/3.0/us/">
+  	<img alt="Creative Commons License" style="border-width:0"
+  	  src="https://i.creativecommons.org/l/by/3.0/us/88x31.png"></a>
+  	This work is licensed under a <a rel="license"
+  	  href="http://creativecommons.org/licenses/by/3.0/us/">Creative Commons
+    Attribution 3.0 United States License</a>.</p></footer>
+    </body>
+  </html>
+#+end_src
+
+** Homepage Template
+
+#+begin_src m4 :tangle src/index.m4
+define([PAGE_TITLE], [Home])dnl
+HEADER
+
+<main id="main" class="news">
+  <h2>Latest News</h2>
+  NEWS
+  <h2><a href="/old.html">ONUM More News</a></h2>
+</main>
+
+FOOTER
+CLEANUP_NEWS
+#+end_src
+
+** Old News Page Template
+
+#+begin_src m4 :tangle src/old.m4
+define([PAGE_TITLE], [Old News])dnl
+HEADER
+
+<main id="main" class="news">
+  <h2>Older News</h2>
+  ONEWS
+  
+  <h2>Even Older News</h2>
+  ENEWS
+  
+  <p><a href="/">&laquo; Back to Home</a></p>
+</main>
+
+FOOTER
+CLEANUP_NEWS
+#+end_src
+
+** Articles Index Template
+
+#+begin_src m4 :tangle src/articles-index.m4
+define([PAGE_TITLE], [Articles])dnl
+HEADER
+
+<main id="main" class="article-list">
+  <h1>Articles</h1>
+  
+  ARTICLE_LIST
+  
+  <p><a href="/">&laquo; Back to Home</a></p>
+</main>
+
+FOOTER
+#+end_src
+
+** Emacs Configuration
+
+#+begin_src elisp :tangle .dir-locals.el
+  ;;; Directory Local Variables
+  ;;; For more information see (info "(emacs) Directory Variables")
+
+  ((org-mode . ((eval . (progn
+                          ;; Set project root path
+                          (defvar my-site-root
+                            (locate-dominating-file default-directory ".dir-locals.el")
+                            "Project root directory.")
+                          
+                          ;; Configure org HTML export settings
+                          (setq org-html-preamble nil)
+                          (setq org-html-postamble nil)
+                          (setq org-html-head-include-default-style nil)
+                          (setq org-html-head-include-scripts nil)
+                          (setq org-html-html5-fancy t)
+                          (setq org-html-doctype "html5")
+                          (setq org-html-validation-link nil)
+                          (setq org-html-head "<link rel=\"stylesheet\" href=\"/css/style.css\">")
+                          
+                          ;; Build current article using Makefile
+                          (defun my-site/build-current-article ()
+                            "Build current org article using Makefile."
+                            (interactive)
+                            (let* ((org-file (buffer-file-name))
+                                   (base-name (file-name-base org-file))
+                                   (target (concat "public/articles/" base-name ".html")))
+                              (compile (format "cd %s && make %s" my-site-root target))))
+                          
+                          ;; Build static pages
+                          (defun my-site/build-pages ()
+                            "Build index and old news pages."
+                            (interactive)
+                            (compile (format "cd %s && make pages" my-site-root)))
+                          
+                          ;; Build everything
+                          (defun my-site/build-all ()
+                            "Build entire site."
+                            (interactive)
+                            (compile (format "cd %s && make all" my-site-root))))))))
+#+end_src
+
+** Local HTTP Server Script
+
+
+** Build System
+
+#+begin_src makefile :tangle Makefile
+  # Use > as recipe prefix instead of TAB
+  .RECIPEPREFIX = >
+
+  # Disable Guile auto-compilation to keep build output clean
+  export GUILE_AUTO_COMPILE = 0
+
+  M4 = m4
+  M4FLAGS = 
+  M4_LAYOUT = src/m4/layout.m4
+  M4_NEWS = src/m4/news.m4
+  M4_CONTENT = src/news-index.m4
+  M4_ALL = $(M4_LAYOUT) $(M4_NEWS) $(M4_CONTENT)
+
+  # Ensure directories exist
+  $(shell mkdir -p public public/articles scripts)
+
+  # Static pages - output to public/
+  public/%.html: src/%.m4 $(M4_ALL) src/templates/header.html.m4 src/templates/footer.html.m4
+  > $(M4) $(M4FLAGS) $(M4_ALL) $< > $@
+
+  # Articles - output to public/articles/
+  public/articles/%.html: src/articles/%.org $(M4_LAYOUT) src/m4/article.m4 src/templates/header.html.m4 src/templates/footer.html.m4 scripts/export-article-body.el scripts/wrap-article.scm scripts/update-news.scm scripts/detect-file-changes.scm
+  > @if [ -d src/articles/$* ]; then \
+  >  mkdir -p public/articles/$*; \
+  >  cp -r src/articles/$*/* public/articles/$*/; \
+  >  echo "Copied images for $*"; \
+  > fi
+  > @echo "Exporting $< to HTML body..."
+  > @emacs --batch --script scripts/export-article-body.el $< src/articles/$*.html
+  > @guile scripts/wrap-article.scm $< src/articles/$*.html $@
+  > @guile scripts/update-news.scm $< $@
+  > @$(MAKE) pages
+
+  # Artilecs index - generated by elisp + guile
+  public/articles/index.html: $(wildcard src/articles/*.org) $(M4_LAYOUT) src/articles-index.m4 src/templates/header.html.m4 src/templates/footer.html.m4 scripts/extract-articles-metadata.el scripts/update-article-index.scm scripts/detect-file-changes.scm
+  > @echo "Generating articles index..."
+  > @guile scripts/update-article-index.scm
+  > @echo "Generated $@"
+
+  # Build all articles
+  articles: $(patsubst src/articles/%.org,public/articles/%.html,$(wildcard src/articles/*.org)) public/articles/index.html
+
+  # Build static pages
+  pages: public/index.html public/old.html public/articles/index.html
+
+  # Build everything
+  all: pages articles
+
+  # Clean generated files
+  clean:
+  > rm -rf public/*.html public/articles/* src/articles/*.html
+
+  # Local preview server
+  serve:
+  > @echo "Starting local server at http://localhost:8000"
+  > @echo "Press Ctrl+C to stop"
+  > @guile scripts/serve.scm
+
+  .PHONY: all clean articles pages serve
+#+end_src
+
+* Build Commands
+
+** Command Line
+
+#+begin_src bash
+# Build everything
+make all
+
+# Build only news pages
+make pages
+
+# Build only articles
+make articles
+
+# Build single article
+make public/articles/ARTICLE_NAME.html
+
+# Clean generated files
+make clean
+
+# Complete rebuild
+make clean
+make all
+
+# Start local preview server
+make serve
+# Then visit http://localhost:8000 in your browser
+#+end_src
+
+* Deployment
+
+** Build and Deploy to SDF
+
+#+begin_src bash
+# Build entire site
+make all
+
+# Upload to SDF using rsync (recommended)
+rsync -avz --delete public/ username@sdf.org:html/
+
+# Or using scp
+scp -r public/* username@sdf.org:html/
+#+end_src
+
+** Directory Structure on SDF
+
+After deployment, your SDF directory structure should be:
+
+#+begin_src
+~/html/                               # Your web root on SDF
+├── index.html                        # https://username.sdf.org/
+├── old.html                          # https://username.sdf.org/old.html
+├── articles/                         # https://username.sdf.org/articles/
+│   └── *.html
+└── css/
+    └── style.css
+#+end_src
+
+* Workflow Examples
+
+** Publishing a New Article
+
+1. Create =src/articles/new-post.org=:
+
+#+begin_src org
+,#+TITLE: New Research Findings
+,#+DATE: 2025-01-15
+,#+TAGS: research, emacs
+
+,* Abstract
+
+Brief summary...
+
+,* Introduction
+
+Detailed content...
+#+end_src
+
+2. Build the article:
+
+#+begin_src bash
+# From command line
+make public/articles/new-post.html
+#+end_src
+
+3. (Optional) Add to news interactively:
+
+#+begin_src bash
+guile scripts/update-news.scm src/articles/new-post.org
+#+end_src
+
+The script will prompt:
+#+begin_example
+Add this article to news? (y/n): y
+News description [I wrote a new post regarding New Research Findings]: 
+Added news item for: New Research Findings
+Rebuilding news pages...
+#+end_example
+
+4. Deploy to SDF:
+
+#+begin_src bash
+rsync -avz --delete public/ username@sdf.org:html/
+#+end_src
+
+** Updating Site Information
+
+1. Edit global variables in =src/m4/layout.m4=
+2. Edit templates in =src/templates/=
+3. Rebuild entire site:
+
+#+begin_src bash
+make clean
+make all
+#+end_src
+
+4. Deploy changes:
+
+#+begin_src bash
+rsync -avz --delete public/ username@sdf.org:html/
+#+end_src
+
+* Advanced Features
+
+** Custom CSS
+
+Create or edit =public/css/style.css= to customize site appearance. The stylesheet is linked in all pages via the =org-html-head= setting.
+
+** Navigation Links
+
+Edit =src/templates/header.html.m4= to modify the navigation menu:
+
+#+begin_src html
+<nav>
+  <a href="#main" class="skip">Skip Navigation</a>&nbsp;
+  <a href="/articles/">Articles</a>
+  <a href="/">News</a>
+  <!-- Add more links here -->
+</nav>
+#+end_src
+
+** Article Index Page
+
+The articles index page is automatically generated from all =*.org= files in =src/articles/=.
+
+*** Key Features
+
+- *Automatic generation*: Scans all =.org= files and extracts titles and dates
+- *Auto-update*: Rebuilds whenever any article is built via =make public/articles/ARTICLE.html=
+- *Sorted by date*: Articles are listed in reverse chronological order (newest first)
+- *Template-based*: Uses =src/articles-index.m4= template with =ARTICLE_LIST= macro
+- *Rich metadata*: Extracts title, author, date, tags, and links from articles
+- *Two-stage pipeline*: Elisp extracts data → Guile generates HTML with M4
+
+*** Data Flow
+
+#+begin_example
+src/articles/*.org (all articles)
+  → scripts/extract-articles-metadata.el (elisp)
+    → Parses org files with org-element API
+    → Extracts #+TITLE:, #+AUTHOR:, #+DATE:, #+TAGS:
+    → Extracts links (org files and URLs)
+    → Outputs S-expression plist data
+  → scripts/generate-article-index.scm (guile)
+    → Reads S-expression data
+    → Sorts by date (reverse)
+    → Formats tags and links as HTML
+    → Generates complete HTML list
+    → Calls M4 with ARTICLE_LIST macro
+  → public/articles/index.html
+#+end_example
+
+** File Change Detection Library
+
+The =detect-file-changes.scm= library provides content-based file change detection using SHA256 hashing. This is more reliable than timestamp comparison, especially when files are regenerated by the build system.
+
+*** Features
+
+- *Content-based comparison*: Uses SHA256 hash instead of modification time
+- *Persistent cache*: Stores hashes in =.cache/file-hashes.scm=
+- *Three states*: Returns ='new=, ='modified=, or ='unchanged=
+- *Automatic cache management*: Creates cache directory if needed
+- *Reusable*: Used by both =update-news.scm= and =update-article-index.scm=
+
+*** Data Flow
+
+#+begin_example
+First build of article:
+  src/articles/test.org (new file)
+    → file-status checks: no HTML exists → 'new
+    → Calculates SHA256 hash of org file
+    → Stores hash in .cache/file-hashes.scm
+    → update-news.scm prompts user
+
+Subsequent builds without changes:
+  src/articles/test.org (unchanged)
+    → file-status checks: hash matches cached → 'unchanged
+    → update-news.scm skips prompting
+
+After modifying article:
+  src/articles/test.org (modified content)
+    → file-status checks: hash differs from cache → 'modified
+    → Updates cached hash
+    → update-news.scm prompts user
+#+end_example
+
+*** Implementation
+
+#+begin_src scheme :tangle scripts/detect-file-changes.scm
+#!/usr/bin/env guile
+!#
+;;; detect-file-changes.scm
+;;; Content-based file change detection using SHA256 hashing
+
+(define-module (detect-file-changes)
+  #:use-module (ice-9 rdelim)
+  #:use-module (ice-9 popen)
+  #:use-module (ice-9 ftw)
+  #:export (file-status
+            get-cached-hash
+            update-hash-cache))
+
+(define cache-dir ".cache")
+(define cache-file (string-append cache-dir "/file-hashes.scm"))
+
+(define (ensure-cache-dir)
+  "Ensure cache directory exists."
+  (unless (file-exists? cache-dir)
+    (mkdir cache-dir)))
+
+(define (file-hash file)
+  "Get SHA256 hash of file content."
+  (if (file-exists? file)
+      (let* ((pipe (open-input-pipe (format #f "sha256sum ~a" file)))
+             (output (read-line pipe)))
+        (close-pipe pipe)
+        (if (eof-object? output)
+            #f
+            (car (string-split output #\space))))
+      #f))
+
+(define (load-hash-cache)
+  "Load hash cache from file."
+  (ensure-cache-dir)
+  (if (file-exists? cache-file)
+      (call-with-input-file cache-file read)
+      '()))
+
+(define (save-hash-cache cache)
+  "Save hash cache to file."
+  (ensure-cache-dir)
+  (call-with-output-file cache-file
+    (lambda (port)
+      (write cache port)
+      (newline port))))
+
+(define (get-cached-hash file)
+  "Get cached hash for file."
+  (let ((cache (load-hash-cache)))
+    (assoc-ref cache file)))
+
+(define (update-hash-cache file hash)
+  "Update hash cache for file."
+  (let* ((cache (load-hash-cache))
+         (new-cache (assoc-set! cache file hash)))
+    (save-hash-cache new-cache)))
+
+(define* (file-status org-file html-file #:optional (update-cache? #t))
+  "Determine file status: 'new, 'modified, or 'unchanged.
+  
+  Compares org file content hash with cached hash.
+  If update-cache? is #t, updates the cache with new hash."
+  (let ((html-exists (file-exists? html-file))
+        (org-hash (file-hash org-file))
+        (cached-hash (get-cached-hash org-file)))
+    (cond
+     ;; HTML doesn't exist - new article
+     ((not html-exists)
+      (when update-cache?
+        (update-hash-cache org-file org-hash))
+      'new)
+     ;; No cached hash - treat as modified
+     ((not cached-hash)
+      (when update-cache?
+        (update-hash-cache org-file org-hash))
+      'modified)
+     ;; Compare hashes
+     ((not (string=? org-hash cached-hash))
+      (when update-cache?
+        (update-hash-cache org-file org-hash))
+      'modified)
+     ;; Unchanged
+     (else 'unchanged))))
+#+end_src
+
+*** Usage Example
+
+#+begin_src scheme
+(use-modules (detect-file-changes))
+
+;; Check file status
+(define status (file-status "src/articles/test.org" 
+                            "public/articles/test.html"))
+
+(case status
+  ((new) (display "New article\n"))
+  ((modified) (display "Modified article\n"))
+  ((unchanged) (display "No changes\n")))
+#+end_src
+
+*** Index Generation Scripts
+
+**** Elisp Script: Extract Article Metadata
+
+The elisp script =scripts/extract-articles-metadata.el= uses org-element API to parse org files and extract comprehensive metadata:
+
+#+begin_src elisp :tangle scripts/extract-articles-metadata.el
+#!/usr/bin/env -S emacs --script
+;; extract-articles-metadata.el
+;; Extract article metadata as S-expression
+
+(require 'org)
+(require 'org-element)
+
+(defun extract-links (tree)
+  "Extract all links from org syntax tree."
+  (let ((links '()))
+    (org-element-map tree 'link
+      (lambda (link)
+        (let* ((type (org-element-property :type link))
+               (path (org-element-property :path link))
+               (raw-desc (car (org-element-contents link)))
+               ;; Remove text properties to get plain text only
+               (desc (if raw-desc
+                        (substring-no-properties raw-desc)
+                      path))
+               (full-path (cond
+                          ;; Org file links: convert .org to .html
+                          ((and (string= type "file") 
+                                (string-suffix-p ".org" path))
+                           (concat "/articles/" 
+                                  (file-name-base path) ".html"))
+                          ;; Online links: keep as-is
+                          ((member type '("http" "https"))
+                           (concat type ":" path))
+                          ;; Other file links
+                          ((string= type "file")
+                           path)
+                          (t nil))))
+          (when full-path
+            (push (list :url full-path :text desc) links)))))
+    (reverse links)))
+
+(defun collect-articles (dir)
+  "Collect all articles from DIR with metadata."
+  (let ((articles '()))
+    (dolist (file (directory-files dir t "\\.org$"))
+      (unless (string-match-p "/\\." (file-name-nondirectory file))
+        (with-temp-buffer
+          (insert-file-contents file)
+          (let* ((tree (org-element-parse-buffer))
+                 (title (org-element-map tree 'keyword
+                          (lambda (kw)
+                            (when (string= (org-element-property :key kw) "TITLE")
+                              (org-element-property :value kw)))
+                          nil t))
+                 (author (org-element-map tree 'keyword
+                           (lambda (kw)
+                             (when (string= (org-element-property :key kw) "AUTHOR")
+                               (org-element-property :value kw)))
+                           nil t))
+                 (date (org-element-map tree 'keyword
+                         (lambda (kw)
+                           (when (string= (org-element-property :key kw) "DATE")
+                             (org-element-property :value kw)))
+                         nil t))
+                 (tags-str (org-element-map tree 'keyword
+                            (lambda (kw)
+                              (when (string= (org-element-property :key kw) "TAGS")
+                                (org-element-property :value kw)))
+                            nil t))
+                 (tags (if tags-str
+                          (split-string tags-str "[ ,]+" t)
+                        '()))
+                 (links (or (extract-links tree) '()))
+                 (base (file-name-base file)))
+            (when title
+              (push (list :title title
+                         :author (or author "")
+                         :date (or date "")
+                         :file base
+                         :tags tags
+                         :links links)
+                    articles))))))
+    articles))
+
+(defun output-article-data (article)
+  "Output article data in Guile-readable format."
+  (let ((title (plist-get article :title))
+        (author (plist-get article :author))
+        (date (plist-get article :date))
+        (file (plist-get article :file))
+        (tags (plist-get article :tags))
+        (links (plist-get article :links)))
+    (format "(:title %S :author %S :date %S :file %S :tags %S :links %S)"
+            title author date file tags links)))
+
+;; Output as S-expression
+(let ((articles (collect-articles "src/articles")))
+  (princ "(")
+  (let ((first t))
+    (dolist (article articles)
+      (unless first (princ " "))
+      (princ (output-article-data article))
+      (setq first nil)))
+  (princ ")\n"))
+#+end_src
+
+**** Guile Script: Update Article Index
+
+The guile script =scripts/update-article-index.scm= reads the S-expression data, checks for changes, and updates the index with M4:
+
+#+begin_src scheme :tangle scripts/update-article-index.scm
+  #!/usr/bin/env guile
+  !#
+  ;;; update-article-index.scm
+  ;;; Read article metadata from elisp and update index with M4
+
+  (add-to-load-path (dirname (current-filename)))
+  (use-modules (site-utils)
+               (ice-9 popen)
+               (ice-9 rdelim)
+               (srfi srfi-1))
+
+  (define (sort-articles articles)
+    "Sort articles by date (descending)."
+    (sort articles
+          (lambda (a b)
+            (string>? (get-property a ':date)
+                     (get-property b ':date)))))
+
+  (define (format-tags tags)
+    "Format tags list as string."
+    (if (or (not tags) (null? tags) (eq? tags 'nil))
+        ""
+        (string-append "<br><small>Tags: " (string-join tags ", ") "</small>")))
+
+  (define (format-links links)
+    "Format links list as HTML."
+    (if (or (not links) (null? links) (eq? links 'nil))
+        ""
+        (string-append "<br><small>Links: "
+                       (string-join
+                        (map (lambda (link)
+                               (let ((url (get-property link ':url))
+                                     (text (get-property link ':text)))
+                                 (format #f "<a href=\"~a\">~a</a>" url text)))
+                             links)
+                        ", ")
+                       "</small>")))
+
+  (define (generate-html-list articles)
+    "Generate HTML list from articles."
+    (if (null? articles)
+        "<p><em>No articles yet.</em></p>"
+        (string-append
+         "<ul>\n"
+         (string-join
+          (map (lambda (art)
+                 (let ((title (get-property art ':title))
+                       (date (get-property art ':date))
+                       (file (get-property art ':file))
+                       (tags (get-property art ':tags))
+                       (links (get-property art ':links)))
+                   (format #f "  <li><a href=\"/articles/~a.html\">~a</a>~a~a~a</li>"
+                           file title
+                           (if (string=? date "") "" (string-append " - " date))
+                           (format-tags tags)
+                           (format-links links))))
+               articles)
+          "\n")
+         "\n</ul>")))
+
+  ;; Main
+  (let* ((articles (extract-all-articles-metadata))
+         (sorted (sort-articles articles))
+         (html-list (generate-html-list sorted))
+         (final-html (call-m4 `(("PAGE_TITLE" . "Articles")
+                                ("ARTICLE_LIST" . ,html-list))
+                              '("src/m4/layout.m4" "src/articles-index.m4"))))
+    (call-with-output-file "public/articles/index.html"
+      (lambda (port)
+        (display final-html port))))
+#+end_src
+
+**** Elisp Script: Export Article Body
+
+The elisp script =scripts/export-article-body.el= exports org files to HTML body only (no header/footer):
+
+#+begin_src elisp :tangle scripts/export-article-body.el
+#!/usr/bin/env -S emacs --script
+;; export-article-body.el
+;; Export org file to HTML body only
+
+(require 'org)
+(require 'ox-html)
+
+(defun my-org-link-filter (text backend info)
+  "Convert article org file links to HTML links.
+  Replaces 'articles/*.org' with '/articles/*.html' in exported HTML."
+  (when (org-export-derived-backend-p backend 'html)
+    (replace-regexp-in-string
+     "href=\"articles/\([^\"]+\)\.org\""
+     "href=\"/articles/\\1.html\""
+     text)))
+
+(defun export-org-to-html-body (org-file output-file)
+  "Export ORG-FILE to HTML body (no header/footer) as OUTPUT-FILE."
+  (with-current-buffer (find-file-noselect org-file)
+    (setq org-html-preamble nil)
+    (setq org-html-postamble nil)
+    (setq org-html-head-include-default-style nil)
+    (setq org-html-head-include-scripts nil)
+    
+    ;; Add link filter
+    (add-to-list 'org-export-filter-final-output-functions
+                 'my-org-link-filter)
+    
+    (org-html-export-to-html nil nil nil t)
+    (let ((generated-file (concat (file-name-sans-extension org-file) ".html")))
+      (when (file-exists-p generated-file)
+        (rename-file generated-file output-file t)))))
+
+;; Main
+(let ((args command-line-args-left))
+  (if (< (length args) 2)
+      (progn
+        (message "Usage: export-article-body.el ORG_FILE OUTPUT_FILE")
+        (kill-emacs 1))
+    (let ((org-file (car args))
+          (output-file (cadr args)))
+      (export-org-to-html-body org-file output-file)
+      (message "Exported %s to %s" org-file output-file))))
+#+end_src
+
+**** Guile Script: Wrap Article with M4
+
+The guile script =scripts/wrap-article.scm= wraps the HTML body with site header/footer:
+
+#+begin_src scheme :tangle scripts/wrap-article.scm
+#!/usr/bin/env guile
+!#
+;;; wrap-article.scm
+;;; Wrap org-exported HTML body with site header/footer using M4
+
+(add-to-load-path (dirname (current-filename)))
+(use-modules (site-utils)
+             (ice-9 rdelim))
+
+(define (read-html-body html-file)
+  "Read HTML body from temporary file."
+  (call-with-input-file html-file
+    (lambda (port)
+      (read-string port))))
+
+;; Main
+(define (main args)
+  (if (< (length args) 4)
+      (begin
+        (display "Usage: wrap-article.scm ORG_FILE HTML_BODY OUTPUT_FILE\n" (current-error-port))
+        (exit 1))
+      (let* ((org-file (list-ref args 1))
+             (html-body-file (list-ref args 2))
+             (output-file (list-ref args 3))
+             (metadata (extract-article-metadata org-file))
+             (title (or (get-property metadata ':title) "Untitled"))
+             (body (read-html-body html-body-file)))
+        (call-m4 `(("PAGE_TITLE" . ,title)
+                   ("ARTICLE_BODY" . ,body))
+                 '("src/m4/layout.m4" "src/m4/article.m4")
+                 output-file)
+        (delete-file html-body-file)
+        (format #t "Generated ~a\n" output-file))))
+
+(main (program-arguments))
+#+end_src
+
+*** Manual Rebuild
+
+If needed, you can rebuild the index manually:
+
+#+begin_src bash
+make public/articles/index.html
+#+end_src
+
+* Future Enhancements
+
+** Automatic News Updates
+
+The site provides an intelligent Guile script that automatically detects when articles are created or modified, and prompts to add them to the news section.
+
+*** Interactive News Update Script
+
+The =scripts/update-news.scm= script provides intelligent news management with the following features:
+
+- *Content-based change detection*: Uses =detect-file-changes.scm= library to compare file hashes
+- *New article detection*: Detects when HTML file doesn't exist yet
+- *Modified article detection*: Compares content hashes to detect real changes
+- *Smart prompts*: Shows article status (new/modified) before asking
+- *Automatic metadata extraction*: Reuses =extract-articles-metadata.el= to get article title
+- *Smart defaults*: Generates sensible news descriptions automatically
+- *Date handling*: Auto-generates current date in YYYY-MM-DD format
+- *Overflow management*: Keeps Latest News section at maximum 2 items
+- *Automatic archiving*: Moves excess items to Older News section
+- *Auto-rebuild*: Rebuilds news pages (=make pages=) after update
+- *Section parsing*: Preserves all existing news sections (BEGNEWS, OLD, ODD, ENDNEWS)
+- *Automatic integration*: Triggered automatically when building articles
+
+*** How It Works
+
+The script performs the following steps:
+
+1. Receives org file and HTML file paths from Makefile
+2. Calls =file-status= from =detect-file-changes.scm= to determine article status:
+   - ='new=: HTML file doesn't exist yet
+   - ='modified=: Org file content hash differs from cached hash
+   - ='unchanged=: Content hash matches cache (skips prompting)
+3. For new or modified articles, prompts user with status information
+4. Calls =extract-articles-metadata.el= to get article metadata
+5. Parses =src/news-index.m4= into sections:
+   - Header (before BEGNEWS)
+   - Latest items (between BEGNEWS and OLD)
+   - Old items (between OLD and ODD)
+   - Older items (between ODD and ENDNEWS)
+   - Footer (after ENDNEWS)
+6. Extracts existing ITEM entries from each section
+7. Adds new item to Latest section
+8. If Latest has > 2 items, moves excess to Old section
+9. Rebuilds and writes =news-index.m4=
+10. Calls =make pages= to regenerate index and old news pages
+
+**** Guile Script: Update News
+
+#+begin_src scheme :tangle scripts/update-news.scm
+  #!/usr/bin/env guile
+  !#
+  ;;; update-news.scm
+  ;;; Add article to news with overflow cleanup
+
+  (add-to-load-path (dirname (current-filename)))
+  (use-modules (detect-file-changes)
+               (site-utils)
+  	     (ice-9 rdelim)
+               (ice-9 regex)
+               (srfi srfi-1))
+
+  ;; Configuration: maximum items in Latest News section
+  (define max-latest-lines 3)
+
+  ;;; News file parsing and rebuilding
+
+  (define (parse-news-file file)
+    "Parse news-index.m4 into sections.
+    
+    Returns: (header latest old older footer)"
+    (call-with-input-file file
+      (lambda (port)
+        (let loop ((section 'header)
+                   (header '())
+                   (latest '())
+                   (old '())
+                   (older '())
+                   (footer '()))
+          (let ((line (read-line port)))
+            (cond
+             ((eof-object? line)
+              (list (reverse header)
+                    (reverse latest)
+                    (reverse old)
+                    (reverse older)
+                    (reverse footer)))
+             ((string-match "^BEGNEWS" line)
+              (loop 'latest (cons line header) latest old older footer))
+             ((string-match "^OLD" line)
+              (loop 'old header latest (cons line old) older footer))
+             ((string-match "^ODD" line)
+              (loop 'older header latest old (cons line older) footer))
+             ((string-match "^ENDNEWS" line)
+              (loop 'footer header latest old older (cons line footer)))
+             ((eq? section 'header)
+              (loop section (cons line header) latest old older footer))
+             ((eq? section 'latest)
+              (loop section header (cons line latest) old older footer))
+             ((eq? section 'old)
+              (loop section header latest (cons line old) older footer))
+             ((eq? section 'older)
+              (loop section header latest old (cons line older) footer))
+             ((eq? section 'footer)
+              (loop section header latest old older (cons line footer)))))))))
+
+  (define (rebuild-news-file sections)
+    "Rebuild news file from sections.
+    
+    sections: (header latest old older footer)"
+    (let ((header (car sections))
+          (latest (cadr sections))
+          (old (caddr sections))
+          (older (cadddr sections))
+          (footer (car (cddddr sections))))
+      (string-join
+       (append header
+               (list "")
+               latest
+               (list "")
+               old
+               (list "")
+               older
+               (list "")
+               footer)
+       "\n"
+       'suffix)))
+
+  ;;; Overflow cleanup logic
+
+  (define (read-non-empty-lines file)
+    "Read all non-empty lines from file."
+    (call-with-input-file file
+      (lambda (port)
+        (let loop ((lines '()))
+          (let ((line (read-line port)))
+            (if (eof-object? line)
+                (reverse lines)
+                (if (non-empty-line? line)
+                    (loop (cons line lines))
+                    (loop lines))))))))
+
+  (define (find-marker-positions lines)
+    "Find positions of BEGNEWS, OLD, ODD, ENDNEWS."
+    (let loop ((idx 0)
+               (remaining lines)
+               (begnews #f)
+               (old #f)
+               (odd #f)
+               (endnews #f))
+      (if (null? remaining)
+          (list begnews old odd endnews)
+          (let ((line (car remaining)))
+            (cond
+             ((string-match "^BEGNEWS" line)
+              (loop (+ idx 1) (cdr remaining) idx old odd endnews))
+             ((string-match "^OLD" line)
+              (loop (+ idx 1) (cdr remaining) begnews idx odd endnews))
+             ((string-match "^ODD" line)
+              (loop (+ idx 1) (cdr remaining) begnews old idx endnews))
+             ((string-match "^ENDNEWS" line)
+              (loop (+ idx 1) (cdr remaining) begnews old odd idx))
+             (else
+              (loop (+ idx 1) (cdr remaining) begnews old odd endnews)))))))
+
+  (define (cleanup-overflow news-file max-lines)
+    "Ensure OLD marker is at the correct position after BEGNEWS."
+    (let* ((lines (read-non-empty-lines news-file))
+           (positions (find-marker-positions lines))
+           (begnews-pos (car positions))
+           (old-pos (cadr positions))
+           (target-old-pos (+ begnews-pos max-lines 1)))
+      
+      (if (not begnews-pos)
+          (display "Warning: BEGNEWS marker not found!\n")
+          (unless (= old-pos target-old-pos)
+            (let* ((lines-without-old 
+                    (append (take lines old-pos)
+                            (drop lines (+ old-pos 1))))
+                   (new-lines 
+                    (append (take lines-without-old target-old-pos)
+                            (list "OLD")
+                            (drop lines-without-old target-old-pos))))
+              (call-with-output-file news-file
+                (lambda (port)
+                  (for-each (lambda (line)
+                              (display line port)
+                              (newline port))
+                            new-lines)))
+              (display (format #f "Cleaned up overflow: moved OLD from line ~a to ~a\n"
+                              (+ old-pos 1) (+ target-old-pos 1))))))))
+
+  ;;; Main news update logic
+
+  (define (add-news-item org-file news-file status)
+    "Add article to news with user interaction."
+    (let* ((metadata (extract-article-metadata org-file))
+           (title (get-property metadata ':title))
+           (base-name (basename org-file ".org"))
+           (date (current-date-string))
+           (status-msg (case status
+                        ((new) "New article created")
+                        ((modified) "Article modified")
+                        (else "Article unchanged")))
+           (default-desc (case status
+                          ((new) (format #f "I wrote a new post regarding ~a" title))
+                          ((modified) (format #f "I updated my post regarding ~a" title))
+                          (else (format #f "New post: ~a" title))))
+           (prompt (format #f "~a: ~a\nAdd to news? (y/n): " status-msg title)))
+      
+      (when (ask-yes-no prompt)
+        (let* ((description (ask-string "News description" default-desc))
+               (new-item (format #f "ITEM([<b>~a</b>: ~a <a href=\"/articles/~a.html\">[Read more]</a>])"
+                                date description base-name))
+               (sections (parse-news-file news-file))
+               (header (car sections))
+               (latest-lines (cadr sections))
+               (old-lines (caddr sections))
+               (older-lines (cadddr sections))
+               (footer (car (cddddr sections)))
+               (new-latest (cons new-item latest-lines))
+               (new-sections (list header new-latest old-lines older-lines footer)))
+          
+          (call-with-output-file news-file
+            (lambda (port)
+              (display (rebuild-news-file new-sections) port)))
+          
+          (display (format #f "Added news item for: ~a\n" title))
+          
+          (cleanup-overflow news-file max-latest-lines)
+          
+          (display "Rebuilding news pages...\n")
+          (system "make pages")))))
+
+  ;; Main
+  (define (main args)
+    (if (< (length args) 3)
+        (begin
+          (display "Usage: update-news.scm ORG_FILE HTML_FILE\n" (current-error-port))
+          (exit 1))
+        (let* ((org-file (cadr args))
+               (html-file (caddr args))
+               (news-file "src/news-index.m4")
+               (status (file-status org-file html-file)))
+          
+          (case status
+            ((new modified)
+             (add-news-item org-file news-file status))
+            (else
+             (display (format #f "Article unchanged, skipping news update.\n")))))))
+
+  (main (command-line))
+#+end_src
+
+**** Usage Examples
+
+***** Automatic Invocation (Recommended)
+
+#+begin_src bash
+# Build article - automatically checks for changes and prompts if needed
+make public/articles/test.html
+#+end_src
+
+Interactive session for new article:
+#+begin_example
+New article created: My Article Title
+Add to news? (y/n): y
+News description [I wrote a new post regarding My Article Title]: I wrote about Emacs and Nix
+Added news item for: My Article Title
+Rebuilding news pages...
+#+end_example
+
+For modified article:
+#+begin_example
+Article modified: My Article Title
+Add to news? (y/n): y
+News description [I wrote a new post regarding My Article Title]: Updated with new examples
+Added news item for: My Article Title
+Rebuilding news pages...
+#+end_example
+
+For unchanged article:
+#+begin_example
+Article unchanged, skipping news update.
+#+end_example
+
+***** Manual Invocation
+
+#+begin_src bash
+# Manually trigger news update for any article
+guile scripts/update-news.scm src/articles/test.org public/articles/test.html
+#+end_src
+
+***** Features Summary
+
+- ✅ Content-based change detection using SHA256 hashes
+- ✅ Smart prompts with article status
+- ✅ No false positives from file regeneration
+- ✅ Persistent hash cache in =.cache/file-hashes.scm=
+- ✅ Latest News limited to 2 items
+- ✅ Overflow automatically moved to OLD section
+- ✅ News pages rebuilt after update
+- ✅ Triggered automatically on =make public/articles/%.html=
+- ✅ Can be called manually if needed
+
+
+
+** Cache Management
+
+The =.cache/= directory should be added to =.gitignore= to avoid committing build artifacts:
+
+#+begin_src gitignore
+# Build cache
+.cache/
+
+# Generated files
+public/
+src/articles/*.html
+#+end_src
+
+** html rules in news.m4
+
+Add macros to support common HTML elements in news items, e.g., links, bold, italics.
+
+** RSS Feed Generation
+
+Generate an RSS feed from news items and recent articles.
+
+** Article List Page and Categories
+
+Support subdirectories in =src/articles/= to organize content tags. Automatically generate an index page listing articles by category. 
+
+* License
+
+This site generator and templates are released into the public domain.
+
+Site content: Creative Commons Attribution 3.0 United States License
+
+Tools used:
+- GNU M4 (GPL)
+- GNU Emacs (GPL)
+- Org Mode (GPL)
+- GNU Make (GPL)
+
+* Author
+
+idiig
+- Website: https://idiig.sdf.org
+- GitHub: https://github.com/idiig
+- Mastodon: https://fedihum.org/@idiig
+- Hosted on: SDF Public Access UNIX System
+
+* Acknowledgments
+Thanks to the developers of:
+- GNU M4
+- GNU Emacs and Org-mode
+- GNU Make
+- SDF.org for hosting and community
+
+Special thanks to the Emacs and Org-mode communities for their excellent documentation and support.
