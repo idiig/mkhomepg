@@ -1,0 +1,15 @@
+#+title: Several lecture notes
+#+date: 2025:12:27
+
+#+caption: CMI-L-S1A: Decision Making by Prof. Takehiro Inohara @ Tokyo Tech 2020 Spring Semester 
+#+attr_latex: scale=0.75
+#+attr_html: :width 30%
+#+label: fig:CMI-L-S1A
+[[file:lecture-notes/CMI-L-S1A.pdf]]
+
+#+caption: CMI-M-S1: Decision Science by Prof. Kimihiko Yamagishi @ Tokyo Tech 2020 Spring Semester
+#+attr_latex: scale=0.75
+#+label: fig:CMI-M-S1
+[[file:lecture-notes/CMI-M-S1.pdf]]
+
+
