@@ -31,7 +31,8 @@
                            path)
                           (t nil))))
           (when full-path
-            (push (format "((url . %S) (text . %S))" full-path desc) links)))))
+            ;; Push alist structure instead of formatted string
+            (push `((url . ,full-path) (text . ,desc)) links)))))
     (reverse links)))
 
 (defun collect-articles (dir)
