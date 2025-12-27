@@ -7,7 +7,7 @@ This site is built with [[https://orgmode.org/][Org mode]], [[https://www.gnu.or
 
 This site generating approach was strongly inspired by [[https://ldbeth.sdf.org/mcs.html][LdBeth's blog]].
 
-I started my this site for practicing my interested tool chains and for
-being known as a job seeker.
+I started my site (this site) for practicing my interested tool chains
+and for being known as a job seeker.
 
 The source code for this site is available at this [[https://github.com/idiig/mkhomepg][GitHub Repo]].

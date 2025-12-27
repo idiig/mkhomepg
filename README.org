@@ -144,116 +144,124 @@ The =scripts/site-utils.scm= module provides shared utilities for all Guile scri
 *** Implementation
 
 #+begin_src scheme :tangle scripts/site-utils.scm
-  #!/usr/bin/env guile
-  !#
+#!/usr/bin/env guile
+!#
 
-  (define-module (site-utils)
-    #:use-module (ice-9 popen)
-    #:use-module (ice-9 rdelim)
-    #:use-module (ice-9 regex)
-    #:use-module (srfi srfi-1)
-    #:export (get-property
-              extract-article-metadata
-              extract-all-articles-metadata
-              call-m4
-              ask-yes-no
-              ask-string
-              current-date-string
-              non-empty-line?
-              filter-non-empty-lines))
+(define-module (site-utils)
+  #:use-module (ice-9 popen)
+  #:use-module (ice-9 match)
+  #:use-module (ice-9 rdelim)
+  #:use-module (ice-9 regex)
+  #:use-module (ice-9 textual-ports)
+  #:use-module (srfi srfi-1)
+  #:export (extract-all-articles-metadata
+            extract-article-metadata
+            m4->string
+            m4->file
+            prompt-yes-no
+            prompt-string
+            current-date-string
+            non-empty-line?
+            filter-non-empty-lines))
 
-  ;;; Plist operations
+;;; Resource management
 
-  (define (get-property plist key)
-    "Get property from plist."
-    (let loop ((lst plist))
-      (cond
-       ((null? lst) #f)
-       ((eq? (car lst) key) (cadr lst))
-       (else (loop (cddr lst))))))
+(define (call-with-input-pipe cmd proc)
+  "Execute CMD and call PROC with the input pipe, ensuring proper cleanup."
+  (let ((p (open-input-pipe cmd)))
+    (dynamic-wind
+      (lambda () #t)
+      (lambda () (proc p))
+      (lambda () (close-pipe p)))))
 
-  ;;; Metadata extraction
+(define (call-with-m4-port args proc)
+  "Call m4 with ARGS and invoke PROC with the input pipe."
+  (let ((p (apply open-pipe* OPEN_READ "m4" args)))
+    (dynamic-wind
+      (lambda () #t)
+      (lambda () (proc p))
+      (lambda () (close-pipe p)))))
 
-  (define (extract-all-articles-metadata)
-    "Extract metadata for all articles using elisp script."
-    (let* ((pipe (open-input-pipe "emacs --batch --script scripts/extract-articles-metadata.el"))
-           (data (read pipe)))
-      (close-pipe pipe)
-      data))
+;;; Metadata extraction
 
-  (define (extract-article-metadata org-file)
-    "Extract metadata for a single article."
-    (let* ((all-data (extract-all-articles-metadata))
-           (base-name (basename org-file ".org")))
-      (find (lambda (article)
-              (string=? (get-property article ':file) base-name))
-            all-data)))
+(define (extract-all-articles-metadata)
+  "Extract metadata for all articles using elisp script."
+  (call-with-input-pipe
+    "emacs --batch --script scripts/extract-articles-metadata.el"
+    (lambda (p) (read p))))
 
-  ;;; M4 calling
+(define (extract-article-metadata org-file)
+  "Extract metadata for a single article."
+  (let* ((all-data (extract-all-articles-metadata))
+         (base-name (basename org-file ".org")))
+    (find (lambda (article)
+            (string=? (assoc-ref article 'file) base-name))
+          all-data)))
 
-  (define* (call-m4 defines files #:optional output-file)
-    "Call M4 with safe parameter passing.
+;;; M4 calling
 
-    defines: Association list of (name . value) pairs for M4 defines
-    files: List of M4 input files to process
-    output-file: Optional output file path (if omitted, returns output as string)
+(define (defines->m4-args defines)
+  "Convert defines alist to m4 command-line arguments."
+  (append-map
+    (lambda (kv)
+      (match kv
+        ((name . value)
+         (list "-D" (format #f "~a=~a" name value)))))
+    defines))
 
-    Example:
-      (call-m4 '((\"PAGE_TITLE\" . \"My Page\")
-                 (\"CONTENT\" . \"<p>Hello</p>\"))
-               '(\"layout.m4\" \"page.m4\")
-               \"output.html\")"
-    (let* ((m4-args (append
-                    (apply append
-                           (map (lambda (def)
-                                  (list "-D" (string-append (car def) "=" (cdr def))))
-                                defines))
-                    files))
-           (pipe (apply open-pipe* OPEN_READ "m4" m4-args))
-           (output (read-string pipe)))
-      (close-pipe pipe)
-      (if output-file
-          (begin
-            (call-with-output-file output-file
-              (lambda (port)
-                (display output port)))
-            output-file)
-          output)))
+(define (m4->string defines files)
+  "Call M4 with defines and files, return output as string.
 
-  ;;; User interaction
+  Example:
+    (m4->string '((\"PAGE_TITLE\" . \"My Page\"))
+                '(\"layout.m4\" \"page.m4\"))"
+  (let ((args (append (defines->m4-args defines) files)))
+    (call-with-m4-port args
+      (lambda (p) (get-string-all p)))))
 
-  (define (ask-yes-no prompt)
-    "Ask user a yes/no question."
-    (display prompt)
-    (force-output)
-    (let ((answer (read-line)))
-      (member answer '("y" "Y" "yes" "Yes" "YES"))))
+(define (m4->file defines files output-file)
+  "Call M4 with defines and files, write output to file.
 
-  (define (ask-string prompt default)
-    "Ask user for input with default value."
-    (display (format #f "~a [~a]: " prompt default))
-    (force-output)
-    (let ((answer (read-line)))
-      (if (string=? answer "")
-          default
-          answer)))
+  Example:
+    (m4->file '((\"PAGE_TITLE\" . \"My Page\"))
+              '(\"layout.m4\" \"page.m4\")
+              \"output.html\")"
+  (call-with-output-file output-file
+    (lambda (out)
+      (display (m4->string defines files) out)))
+  output-file)
 
-  ;;; Date utilities
+;;; User interaction
 
-  (define (current-date-string)
-    "Get current date in YYYY-MM-DD format."
-    (strftime "%Y-%m-%d" (localtime (current-time))))
+(define (prompt-yes-no prompt)
+  "Ask user a yes/no question."
+  (display prompt)
+  (force-output)
+  (member (read-line) '("y" "Y" "yes" "Yes" "YES")))
 
-  ;;; String utilities
+(define* (prompt-string prompt #:key (default ""))
+  "Ask user for input with default value."
+  (display (format #f "~a [~a]: " prompt default))
+  (force-output)
+  (let ((answer (read-line)))
+    (if (string=? answer "") default answer)))
 
-  (define (non-empty-line? line)
-    "Check if line is non-empty (not just whitespace)."
-    (and (string? line)
-         (not (string-match "^[[:space:]]*$" line))))
+;;; Date utilities
 
-  (define (filter-non-empty-lines lines)
-    "Filter out empty lines from a list."
-    (filter non-empty-line? lines))
+(define (current-date-string)
+  "Get current date in YYYY-MM-DD format."
+  (strftime "%Y-%m-%d" (localtime (current-time))))
+
+;;; String utilities
+
+(define (non-empty-line? line)
+  "Check if line is non-empty (not just whitespace)."
+  (and (string? line)
+       (not (string-match "^[[:space:]]*$" line))))
+
+(define (filter-non-empty-lines lines)
+  "Filter out empty lines from a list."
+  (filter non-empty-line? lines))
 #+end_src
 
 ** Article System
@@ -998,7 +1006,7 @@ The elisp script =scripts/extract-articles-metadata.el= uses org-element API to 
                            path)
                           (t nil))))
           (when full-path
-            (push (list :url full-path :text desc) links)))))
+            (push (format "((url . %S) (text . %S))" full-path desc) links)))))
     (reverse links)))
 
 (defun collect-articles (dir)
@@ -1045,14 +1053,14 @@ The elisp script =scripts/extract-articles-metadata.el= uses org-element API to 
     articles))
 
 (defun output-article-data (article)
-  "Output article data in Guile-readable format."
+  "Output article data in alist format for Guile."
   (let ((title (plist-get article :title))
         (author (plist-get article :author))
         (date (plist-get article :date))
         (file (plist-get article :file))
         (tags (plist-get article :tags))
         (links (plist-get article :links)))
-    (format "(:title %S :author %S :date %S :file %S :tags %S :links %S)"
+    (format "((title . %S) (author . %S) (date . %S) (file . %S) (tags . %S) (links . %S))"
             title author date file tags links)))
 
 ;; Output as S-expression
@@ -1086,8 +1094,8 @@ The guile script =scripts/update-article-index.scm= reads the S-expression data,
     "Sort articles by date (descending)."
     (sort articles
           (lambda (a b)
-            (string>? (get-property a ':date)
-                     (get-property b ':date)))))
+            (string>? (assoc-ref a 'date)
+                     (assoc-ref b 'date)))))
 
   (define (format-tags tags)
     "Format tags list as string."
@@ -1102,8 +1110,8 @@ The guile script =scripts/update-article-index.scm= reads the S-expression data,
         (string-append "<br><small>Links: "
                        (string-join
                         (map (lambda (link)
-                               (let ((url (get-property link ':url))
-                                     (text (get-property link ':text)))
+                               (let ((url (assoc-ref link 'url))
+                                     (text (assoc-ref link 'text)))
                                  (format #f "<a href=\"~a\">~a</a>" url text)))
                              links)
                         ", ")
@@ -1117,11 +1125,11 @@ The guile script =scripts/update-article-index.scm= reads the S-expression data,
          "<ul>\n"
          (string-join
           (map (lambda (art)
-                 (let ((title (get-property art ':title))
-                       (date (get-property art ':date))
-                       (file (get-property art ':file))
-                       (tags (get-property art ':tags))
-                       (links (get-property art ':links)))
+                 (let ((title (assoc-ref art 'title))
+                       (date (assoc-ref art 'date))
+                       (file (assoc-ref art 'file))
+                       (tags (assoc-ref art 'tags))
+                       (links (assoc-ref art 'links)))
                    (format #f "  <li><a href=\"/articles/~a.html\">~a</a>~a~a~a</li>"
                            file title
                            (if (string=? date "") "" (string-append " - " date))
@@ -1134,13 +1142,11 @@ The guile script =scripts/update-article-index.scm= reads the S-expression data,
   ;; Main
   (let* ((articles (extract-all-articles-metadata))
          (sorted (sort-articles articles))
-         (html-list (generate-html-list sorted))
-         (final-html (call-m4 `(("PAGE_TITLE" . "Articles")
-                                ("ARTICLE_LIST" . ,html-list))
-                              '("src/m4/layout.m4" "src/articles-index.m4"))))
-    (call-with-output-file "public/articles/index.html"
-      (lambda (port)
-        (display final-html port))))
+         (html-list (generate-html-list sorted)))
+    (m4->file `(("PAGE_TITLE" . "Articles")
+                ("ARTICLE_LIST" . ,html-list))
+              '("src/m4/layout.m4" "src/articles-index.m4")
+              "public/articles/index.html"))
 #+end_src
 
 **** Elisp Script: Export Article Body
@@ -1223,12 +1229,12 @@ The guile script =scripts/wrap-article.scm= wraps the HTML body with site header
              (html-body-file (list-ref args 2))
              (output-file (list-ref args 3))
              (metadata (extract-article-metadata org-file))
-             (title (or (get-property metadata ':title) "Untitled"))
+             (title (or (assoc-ref metadata 'title) "Untitled"))
              (body (read-html-body html-body-file)))
-        (call-m4 `(("PAGE_TITLE" . ,title)
-                   ("ARTICLE_BODY" . ,body))
-                 '("src/m4/layout.m4" "src/m4/article.m4")
-                 output-file)
+        (m4->file `(("PAGE_TITLE" . ,title)
+                    ("ARTICLE_BODY" . ,body))
+                  '("src/m4/layout.m4" "src/m4/article.m4")
+                  output-file)
         (delete-file html-body-file)
         (format #t "Generated ~a\n" output-file))))
 
@@ -1439,7 +1445,7 @@ The script performs the following steps:
   (define (add-news-item org-file news-file status)
     "Add article to news with user interaction."
     (let* ((metadata (extract-article-metadata org-file))
-           (title (get-property metadata ':title))
+           (title (assoc-ref metadata 'title))
            (base-name (basename org-file ".org"))
            (date (current-date-string))
            (status-msg (case status
@@ -1452,8 +1458,8 @@ The script performs the following steps:
                           (else (format #f "New post: ~a" title))))
            (prompt (format #f "~a: ~a\nAdd to news? (y/n): " status-msg title)))
       
-      (when (ask-yes-no prompt)
-        (let* ((description (ask-string "News description" default-desc))
+      (when (prompt-yes-no prompt)
+        (let* ((description (prompt-string "News description" #:default default-desc))
                (new-item (format #f "ITEM([<b>~a</b>: ~a <a href=\"/articles/~a.html\">[Read more]</a>])"
                                 date description base-name))
                (sections (parse-news-file news-file))

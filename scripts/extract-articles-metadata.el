@@ -31,7 +31,7 @@
                            path)
                           (t nil))))
           (when full-path
-            (push (list :url full-path :text desc) links)))))
+            (push (format "((url . %S) (text . %S))" full-path desc) links)))))
     (reverse links)))
 
 (defun collect-articles (dir)
@@ -78,14 +78,14 @@
     articles))
 
 (defun output-article-data (article)
-  "Output article data in Guile-readable format."
+  "Output article data in alist format for Guile."
   (let ((title (plist-get article :title))
         (author (plist-get article :author))
         (date (plist-get article :date))
         (file (plist-get article :file))
         (tags (plist-get article :tags))
         (links (plist-get article :links)))
-    (format "(:title %S :author %S :date %S :file %S :tags %S :links %S)"
+    (format "((title . %S) (author . %S) (date . %S) (file . %S) (tags . %S) (links . %S))"
             title author date file tags links)))
 
 ;; Output as S-expression

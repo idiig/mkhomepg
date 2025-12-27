@@ -145,7 +145,7 @@
 (define (add-news-item org-file news-file status)
   "Add article to news with user interaction."
   (let* ((metadata (extract-article-metadata org-file))
-         (title (get-property metadata ':title))
+         (title (assoc-ref metadata 'title))
          (base-name (basename org-file ".org"))
          (date (current-date-string))
          (status-msg (case status
@@ -158,8 +158,8 @@
                         (else (format #f "New post: ~a" title))))
          (prompt (format #f "~a: ~a\nAdd to news? (y/n): " status-msg title)))
     
-    (when (ask-yes-no prompt)
-      (let* ((description (ask-string "News description" default-desc))
+    (when (prompt-yes-no prompt)
+      (let* ((description (prompt-string "News description" #:default default-desc))
              (new-item (format #f "ITEM([<b>~a</b>: ~a <a href=\"/articles/~a.html\">[Read more]</a>])"
                               date description base-name))
              (sections (parse-news-file news-file))

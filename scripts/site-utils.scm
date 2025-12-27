@@ -3,94 +3,102 @@
 
 (define-module (site-utils)
   #:use-module (ice-9 popen)
+  #:use-module (ice-9 match)
   #:use-module (ice-9 rdelim)
   #:use-module (ice-9 regex)
+  #:use-module (ice-9 textual-ports)
   #:use-module (srfi srfi-1)
-  #:export (get-property
+  #:export (extract-all-articles-metadata
             extract-article-metadata
-            extract-all-articles-metadata
-            call-m4
-            ask-yes-no
-            ask-string
+            m4->string
+            m4->file
+            prompt-yes-no
+            prompt-string
             current-date-string
             non-empty-line?
             filter-non-empty-lines))
 
-;;; Plist operations
+;;; Resource management
 
-(define (get-property plist key)
-  "Get property from plist."
-  (let loop ((lst plist))
-    (cond
-     ((null? lst) #f)
-     ((eq? (car lst) key) (cadr lst))
-     (else (loop (cddr lst))))))
+(define (call-with-input-pipe cmd proc)
+  "Execute CMD and call PROC with the input pipe, ensuring proper cleanup."
+  (let ((p (open-input-pipe cmd)))
+    (dynamic-wind
+      (lambda () #t)
+      (lambda () (proc p))
+      (lambda () (close-pipe p)))))
+
+(define (call-with-m4-port args proc)
+  "Call m4 with ARGS and invoke PROC with the input pipe."
+  (let ((p (apply open-pipe* OPEN_READ "m4" args)))
+    (dynamic-wind
+      (lambda () #t)
+      (lambda () (proc p))
+      (lambda () (close-pipe p)))))
 
 ;;; Metadata extraction
 
 (define (extract-all-articles-metadata)
   "Extract metadata for all articles using elisp script."
-  (let* ((pipe (open-input-pipe "emacs --batch --script scripts/extract-articles-metadata.el"))
-         (data (read pipe)))
-    (close-pipe pipe)
-    data))
+  (call-with-input-pipe
+    "emacs --batch --script scripts/extract-articles-metadata.el"
+    (lambda (p) (read p))))
 
 (define (extract-article-metadata org-file)
   "Extract metadata for a single article."
   (let* ((all-data (extract-all-articles-metadata))
          (base-name (basename org-file ".org")))
     (find (lambda (article)
-            (string=? (get-property article ':file) base-name))
+            (string=? (assoc-ref article 'file) base-name))
           all-data)))
 
 ;;; M4 calling
 
-(define* (call-m4 defines files #:optional output-file)
-  "Call M4 with safe parameter passing.
+(define (defines->m4-args defines)
+  "Convert defines alist to m4 command-line arguments."
+  (append-map
+    (lambda (kv)
+      (match kv
+        ((name . value)
+         (list "-D" (format #f "~a=~a" name value)))))
+    defines))
 
-  defines: Association list of (name . value) pairs for M4 defines
-  files: List of M4 input files to process
-  output-file: Optional output file path (if omitted, returns output as string)
+(define (m4->string defines files)
+  "Call M4 with defines and files, return output as string.
 
   Example:
-    (call-m4 '((\"PAGE_TITLE\" . \"My Page\")
-               (\"CONTENT\" . \"<p>Hello</p>\"))
-             '(\"layout.m4\" \"page.m4\")
-             \"output.html\")"
-  (let* ((m4-args (append
-                  (apply append
-                         (map (lambda (def)
-                                (list "-D" (string-append (car def) "=" (cdr def))))
-                              defines))
-                  files))
-         (pipe (apply open-pipe* OPEN_READ "m4" m4-args))
-         (output (read-string pipe)))
-    (close-pipe pipe)
-    (if output-file
-        (begin
-          (call-with-output-file output-file
-            (lambda (port)
-              (display output port)))
-          output-file)
-        output)))
+    (m4->string '((\"PAGE_TITLE\" . \"My Page\"))
+                '(\"layout.m4\" \"page.m4\"))"
+  (let ((args (append (defines->m4-args defines) files)))
+    (call-with-m4-port args
+      (lambda (p) (get-string-all p)))))
+
+(define (m4->file defines files output-file)
+  "Call M4 with defines and files, write output to file.
+
+  Example:
+    (m4->file '((\"PAGE_TITLE\" . \"My Page\"))
+              '(\"layout.m4\" \"page.m4\")
+              \"output.html\")"
+  (call-with-output-file output-file
+    (lambda (out)
+      (display (m4->string defines files) out)))
+  output-file)
 
 ;;; User interaction
 
-(define (ask-yes-no prompt)
+(define (prompt-yes-no prompt)
   "Ask user a yes/no question."
   (display prompt)
   (force-output)
-  (let ((answer (read-line)))
-    (member answer '("y" "Y" "yes" "Yes" "YES"))))
+  (member (read-line) '("y" "Y" "yes" "Yes" "YES")))
 
-(define (ask-string prompt default)
+(define* (prompt-string prompt #:key (default ""))
   "Ask user for input with default value."
   (display (format #f "~a [~a]: " prompt default))
   (force-output)
   (let ((answer (read-line)))
-    (if (string=? answer "")
-        default
-        answer)))
+    (if (string=? answer "") default answer)))
 
 ;;; Date utilities
 
